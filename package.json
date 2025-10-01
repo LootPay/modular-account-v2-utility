@@ -5,8 +5,8 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "sh dev.sh",
+    "build": "sh build.sh",
     "lint": "eslint .",
     "preview": "vite preview"
   },
