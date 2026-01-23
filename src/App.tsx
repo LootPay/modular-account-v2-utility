@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Wallet,
   JsonRpcProvider,
@@ -8,6 +8,8 @@ import {
   parseUnits,
   formatEther,
   parseEther,
+  Network,
+  ethers,
 } from "ethers";
 
 import {
@@ -18,9 +20,17 @@ import {
   Wallet as LucideWallet,
   ExternalLink,
 } from "lucide-react";
+import type { FetchRequest, JsonRpcApiProviderOptions } from "ethers";
 
 const USDT_POLYGON_ADDRESS = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
-const POLYGON_RPC = "https://polygon-rpc.com";
+
+// Default RPC (fallback)
+const DEFAULT_RPC = "https://polygon-rpc.com";
+
+interface RpcOption {
+  name: string;
+  url: string;
+}
 
 const USDT_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
@@ -44,6 +54,64 @@ interface WalletInfo {
   signer: Wallet;
 }
 
+const defaultRpcOptions: JsonRpcApiProviderOptions = {
+  batchMaxCount: 1, // Disable batching to avoid rate limits
+  batchStallTime: 2000, // Wait 2s before batching
+  staticNetwork: Network.from(137),
+  polling: false, // Disable automatic polling
+};
+
+// Rate limiting configuration
+const RATE_LIMIT_CONFIG = {
+  slotInterval: 1000, // Wait 1 second between requests
+  maxAttempts: 3, // Retry up to 3 times on failure
+  retryDelay: 2000, // Wait 2 seconds before retry
+};
+
+// Cache providers to reuse throttled instances
+const providerCache = new Map<string, JsonRpcProvider>();
+
+const buildFetchRequest = (url: string): FetchRequest => {
+  const req = new ethers.FetchRequest(url);
+  // Configure throttling to limit request rate
+  req.setThrottleParams({
+    maxAttempts: RATE_LIMIT_CONFIG.maxAttempts,
+    slotInterval: RATE_LIMIT_CONFIG.slotInterval,
+  });
+  return req;
+};
+
+const getProvider = (url: string): JsonRpcProvider => {
+  // Reuse cached provider if available (with throttling already configured)
+  if (providerCache.has(url)) {
+    return providerCache.get(url)!;
+  }
+
+  // Create new provider with rate limiting
+  const provider = new JsonRpcProvider(
+    buildFetchRequest(url),
+    Network.from(137),
+    defaultRpcOptions
+  );
+
+  // Cache the provider
+  providerCache.set(url, provider);
+  return provider;
+};
+
+// Clear provider cache when RPC changes
+const clearProviderCache = (exceptUrl?: string) => {
+  if (exceptUrl) {
+    const keepProvider = providerCache.get(exceptUrl);
+    providerCache.clear();
+    if (keepProvider) {
+      providerCache.set(exceptUrl, keepProvider);
+    }
+  } else {
+    providerCache.clear();
+  }
+};
+
 const USDTTransferApp: React.FC = () => {
   const [mnemonic, setMnemonic] = useState("");
   const [smartWalletAddress, setSmartWalletAddress] = useState("");
@@ -58,6 +126,204 @@ const USDTTransferApp: React.FC = () => {
   const [maticBalance, setMaticBalance] = useState<string | null>(null);
   const [loadingBalance, setLoadingBalance] = useState(false);
   const [estimatedGas, setEstimatedGas] = useState<string | null>(null);
+  const [rpcOptions, setRpcOptions] = useState<RpcOption[]>([
+    { name: DEFAULT_RPC, url: DEFAULT_RPC },
+  ]);
+  const [selectedRpc, setSelectedRpc] = useState<string>(DEFAULT_RPC);
+  const [loadingRpc, setLoadingRpc] = useState<boolean>(true);
+  const previousRpcRef = useRef<string>("");
+  const reconnectAbortControllerRef = useRef<AbortController | null>(null);
+  const balanceAbortControllerRef = useRef<AbortController | null>(null);
+  const isReconnectingRef = useRef<boolean>(false);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isFetchingBalancesRef = useRef<boolean>(false);
+
+  // Fetch public RPCs from Chainlist
+  useEffect(() => {
+    const fetchChainlistRPCs = async () => {
+      try {
+        setLoadingRpc(true);
+        // Chainlist API endpoint for Polygon (chainId: 137)
+        const response = await fetch("https://chainid.network/chains.json");
+        const chains = await response.json();
+        interface ChainInfo {
+          chainId: number;
+          rpc: string[];
+        }
+        const polygon = chains.find(
+          (chain: ChainInfo) => chain.chainId === 137
+        );
+
+        if (polygon && polygon.rpc && Array.isArray(polygon.rpc)) {
+          // Filter only public HTTPS RPCs (no API keys, no authentication)
+          const publicRPCs = polygon.rpc
+            .filter((rpc: string) => {
+              const url = typeof rpc === "string" ? rpc : "";
+              return (
+                url.startsWith("https://") &&
+                !url.includes("${") &&
+                !url.includes("apiKey") &&
+                !url.includes("apikey") &&
+                !url.includes("API_KEY") &&
+                !url.includes("key=") &&
+                !url.includes("auth") &&
+                !url.includes("demo") &&
+                !url.includes("test")
+              );
+            })
+            .map((rpc: string) => {
+              const url = typeof rpc === "string" ? rpc : "";
+              // Use URL as name
+              return { name: url, url };
+            })
+            .filter(
+              (rpc: RpcOption, index: number, self: RpcOption[]) =>
+                index === self.findIndex((t) => t.url === rpc.url)
+            ) // Remove duplicates
+            .slice(0, 10); // Limit to 10 RPCs
+
+          if (publicRPCs.length > 0) {
+            setRpcOptions(publicRPCs);
+            setSelectedRpc(publicRPCs[0].url);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to fetch RPCs from Chainlist:", err);
+        // Keep default RPC on error
+        setRpcOptions([{ name: DEFAULT_RPC, url: DEFAULT_RPC }]);
+      } finally {
+        setLoadingRpc(false);
+      }
+    };
+
+    fetchChainlistRPCs();
+  }, []);
+
+  // Reconnect wallet when RPC changes (if wallet is already imported)
+  useEffect(() => {
+    // Clear any pending timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+
+    // Cancel any ongoing reconnection and balance fetches
+    if (reconnectAbortControllerRef.current) {
+      reconnectAbortControllerRef.current.abort();
+      reconnectAbortControllerRef.current = null;
+    }
+    if (balanceAbortControllerRef.current) {
+      balanceAbortControllerRef.current.abort();
+      balanceAbortControllerRef.current = null;
+    }
+
+    // Clear provider cache when RPC changes (keep current RPC provider)
+    if (
+      previousRpcRef.current !== "" &&
+      previousRpcRef.current !== selectedRpc
+    ) {
+      clearProviderCache(selectedRpc);
+    }
+
+    // Only reconnect if RPC actually changed and wallet is imported
+    if (
+      walletInfo &&
+      mnemonic.trim() &&
+      previousRpcRef.current !== "" &&
+      previousRpcRef.current !== selectedRpc &&
+      !isReconnectingRef.current
+    ) {
+      // Update the previous RPC reference immediately to prevent loops
+      previousRpcRef.current = selectedRpc;
+      isReconnectingRef.current = true;
+
+      // Debounce the reconnection to avoid rapid changes
+      reconnectTimeoutRef.current = setTimeout(() => {
+        const abortController = new AbortController();
+        reconnectAbortControllerRef.current = abortController;
+
+        const reconnectWallet = async () => {
+          try {
+            // Check if still valid (RPC hasn't changed again)
+            if (
+              previousRpcRef.current !== selectedRpc ||
+              abortController.signal.aborted
+            ) {
+              return;
+            }
+
+            setError(""); // Clear previous errors
+
+            const provider = getProvider(selectedRpc);
+            const wallet = Wallet.fromPhrase(mnemonic);
+            const signer = wallet.connect(provider);
+
+            // Check if aborted
+            if (abortController.signal.aborted) {
+              return;
+            }
+
+            setWalletInfo({
+              eoaAddress: wallet.address,
+              smartWalletAddress: walletInfo.smartWalletAddress,
+              signer: signer as unknown as Wallet,
+            });
+
+            // Check if aborted before fetching balances
+            if (abortController.signal.aborted) {
+              return;
+            }
+
+            // Update balances with new RPC, passing the abort signal
+            await getBalances(
+              walletInfo.smartWalletAddress,
+              wallet.address,
+              selectedRpc,
+              abortController.signal
+            );
+          } catch (err) {
+            // Don't set error if aborted
+            if (abortController.signal.aborted) {
+              return;
+            }
+            const message = err instanceof Error ? err.message : String(err);
+            setError("Failed to reconnect with new RPC: " + message);
+          } finally {
+            if (!abortController.signal.aborted) {
+              isReconnectingRef.current = false;
+            }
+            if (reconnectAbortControllerRef.current === abortController) {
+              reconnectAbortControllerRef.current = null;
+            }
+          }
+        };
+
+        reconnectWallet();
+      }, 500); // 500ms debounce
+    } else if (previousRpcRef.current === "") {
+      // First time, just update the reference
+      previousRpcRef.current = selectedRpc;
+    }
+
+    // Cleanup function
+    return () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (reconnectAbortControllerRef.current) {
+        reconnectAbortControllerRef.current.abort();
+        reconnectAbortControllerRef.current = null;
+      }
+      if (balanceAbortControllerRef.current) {
+        balanceAbortControllerRef.current.abort();
+        balanceAbortControllerRef.current = null;
+      }
+      isReconnectingRef.current = false;
+      isFetchingBalancesRef.current = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRpc]);
 
   const validateInputs = (): boolean => {
     if (!mnemonic.trim()) {
@@ -81,13 +347,39 @@ const USDTTransferApp: React.FC = () => {
 
   const getBalances = async (
     address: string,
-    eoaAddress: string
+    eoaAddress: string,
+    rpcUrl?: string,
+    signal?: AbortSignal
   ): Promise<void> => {
+    // Cancel any ongoing balance fetch
+    if (balanceAbortControllerRef.current) {
+      balanceAbortControllerRef.current.abort();
+      balanceAbortControllerRef.current = null;
+    }
+
+    // Prevent multiple simultaneous calls
+    if (isFetchingBalancesRef.current) {
+      console.log("Balance fetch already in progress, skipping...");
+      return;
+    }
+
+    isFetchingBalancesRef.current = true;
+    const abortController = new AbortController();
+    balanceAbortControllerRef.current = abortController;
+
+    // Use provided signal or create a combined one
+    const finalSignal = signal || abortController.signal;
+
     setLoadingBalance(true);
     try {
-      console.log("Fetching balances for:", address);
-      console.log("Fetching balances for:", eoaAddress);
-      const provider = new JsonRpcProvider(POLYGON_RPC);
+      const rpc = rpcUrl || selectedRpc;
+      console.log("Fetching balances for:", address, "using RPC:", rpc);
+      const provider = getProvider(rpc);
+
+      // Check if aborted before making requests
+      if (finalSignal.aborted) {
+        return;
+      }
 
       // Get USDT balance
       const usdtContract = new Contract(
@@ -96,20 +388,53 @@ const USDTTransferApp: React.FC = () => {
         provider
       );
       const balance = await usdtContract.balanceOf(address);
-      const decimals = await usdtContract.decimals();
 
+      // Check if aborted
+      if (finalSignal.aborted) {
+        return;
+      }
+
+      const decimals = await usdtContract.decimals();
       const formattedBalance = formatUnits(balance, decimals);
+
+      // Check if aborted before setting state
+      if (finalSignal.aborted) {
+        return;
+      }
+
       setUsdtBalance(formattedBalance);
 
       // Get MATIC balance
       const maticBalanceWei = await provider.getBalance(eoaAddress);
+
+      // Check if aborted
+      if (finalSignal.aborted) {
+        return;
+      }
+
       const formattedMaticBalance = formatEther(maticBalanceWei);
+
+      // Check if aborted before setting state
+      if (finalSignal.aborted) {
+        return;
+      }
+
       setMaticBalance(formattedMaticBalance);
     } catch (err) {
+      // Don't set error if aborted
+      if (finalSignal.aborted) {
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       setError("Failed to fetch balances: " + message);
     } finally {
-      setLoadingBalance(false);
+      isFetchingBalancesRef.current = false;
+      if (!finalSignal.aborted) {
+        setLoadingBalance(false);
+      }
+      if (balanceAbortControllerRef.current === abortController) {
+        balanceAbortControllerRef.current = null;
+      }
     }
   };
 
@@ -128,7 +453,7 @@ const USDTTransferApp: React.FC = () => {
     setLoading(true);
 
     try {
-      const provider = new JsonRpcProvider(POLYGON_RPC);
+      const provider = getProvider(selectedRpc);
       const wallet = Wallet.fromPhrase(mnemonic);
       const signer = wallet.connect(provider);
 
@@ -137,6 +462,9 @@ const USDTTransferApp: React.FC = () => {
         smartWalletAddress: smartWalletAddress,
         signer: signer as unknown as Wallet,
       });
+
+      // Update RPC reference when wallet is first imported
+      previousRpcRef.current = selectedRpc;
 
       await getBalances(smartWalletAddress, wallet.address);
 
@@ -163,7 +491,7 @@ const USDTTransferApp: React.FC = () => {
     setLoading(true);
 
     try {
-      const provider = new JsonRpcProvider(POLYGON_RPC);
+      const provider = getProvider(selectedRpc);
       const { signer } = walletInfo;
 
       // Encode USDT transfer
@@ -191,7 +519,9 @@ const USDTTransferApp: React.FC = () => {
       // Estimate gas fees
       const feeData = await provider.getFeeData();
       const gasLimit = 200000n; // Estimate for execute call
-      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice || 0n;
+      // gas + 20% margin
+      const maxFeePerGas =
+        ((feeData.maxFeePerGas || feeData.gasPrice || 0n) * 200n) / 100n;
       const estimatedGasCost = gasLimit * maxFeePerGas;
       const estimatedGasCostInMatic = formatEther(estimatedGasCost);
 
@@ -303,6 +633,38 @@ const USDTTransferApp: React.FC = () => {
           )}
 
           <div className="space-y-6">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                RPC Endpoint (Public from Chainlist)
+              </label>
+              {loadingRpc ? (
+                <div className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-50 flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
+                  <span className="text-sm text-gray-600">
+                    Loading RPCs from Chainlist...
+                  </span>
+                </div>
+              ) : (
+                <select
+                  value={selectedRpc}
+                  onChange={(e) => setSelectedRpc(e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all bg-white"
+                  disabled={loading}
+                >
+                  {rpcOptions.map((rpc, index) => (
+                    <option key={index} value={rpc.url}>
+                      {rpc.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <p className="text-xs text-gray-500 mt-1">
+                Current:{" "}
+                {rpcOptions.find((rpc) => rpc.url === selectedRpc)?.name ||
+                  selectedRpc}
+              </p>
+            </div>
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
                 Mnemonic Phrase
