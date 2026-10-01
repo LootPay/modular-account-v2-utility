@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Wallet,
   JsonRpcProvider,
@@ -7,7 +7,8 @@ import {
   formatUnits,
   parseUnits,
   formatEther,
-  parseEther,
+  isAddress,
+  getAddress,
   Network,
   ethers,
 } from "ethers";
@@ -19,53 +20,78 @@ import {
   Send,
   Wallet as LucideWallet,
   ExternalLink,
+  Rocket,
+  RefreshCw,
+  Copy,
+  Check,
 } from "lucide-react";
-import type { FetchRequest, JsonRpcApiProviderOptions } from "ethers";
+import type { FetchRequest } from "ethers";
+import { SUPPORTED_CHAINS, type SupportedChain } from "./chains";
 
-const USDT_POLYGON_ADDRESS = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F";
+// Modular Account V2 contracts (same address on every supported chain)
+const FACTORY_ADDRESS = "0x00000000000017c61b5bEe81050EC8eFc9c6fecd";
+const SEMI_MODULAR_ACCOUNT_IMPL = "0x000000000000c5A9089039570Dd36455b5C07383";
+const ACCOUNT_SALT = 0n;
 
-// Default RPC (fallback)
-const DEFAULT_RPC = "https://polygon-rpc.com";
+const DEFAULT_CHAIN_ID = 137;
+const CUSTOM_RPC = "__custom__";
+const NATIVE_ASSET = "native";
+const CUSTOM_TOKEN = "custom";
 
-interface RpcOption {
-  name: string;
-  url: string;
-}
+const FACTORY_ABI = [
+  "function createSemiModularAccount(address owner, uint256 salt) returns (address)",
+  "function getAddressSemiModular(address owner, uint256 salt) view returns (address)",
+];
 
-const USDT_ABI = [
+const ERC20_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
   "function balanceOf(address account) view returns (uint256)",
   "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
 ];
 
-// Smart Wallet ABI - métodos comuns de Account Abstraction
+// The owner (fallback signer) can call execute directly, so no bundler is needed.
 const SMART_WALLET_ABI = [
-  "function execute(address dest, uint256 value, bytes calldata func) external",
-  "function executeBatch(address[] calldata dest, uint256[] calldata value, bytes[] calldata func) external",
+  "function execute(address target, uint256 value, bytes data) payable returns (bytes)",
 ];
+
+// Safety margins applied on top of the node's estimates
+const GAS_LIMIT_MARGIN_PCT = 120n;
+const FEE_MARGIN_PCT = 150n;
+
+// Rough gas usage, used to suggest how much native token to send to the
+// signer. Doubled to cover L1 data fees on rollups and price swings.
+const DEPLOY_GAS_UNITS = 150_000n;
+const TRANSFER_GAS_UNITS = 120_000n;
+const SUGGESTED_GAS_MARGIN_PCT = 200n;
 
 type DefaultError = {
-  code: string;
+  code?: string;
+  shortMessage?: string;
   message: string;
 };
-interface WalletInfo {
-  eoaAddress: string;
-  smartWalletAddress: string;
-  signer: Wallet;
+
+interface TokenInfo {
+  address: string;
+  symbol: string;
+  decimals: number;
 }
 
-const defaultRpcOptions: JsonRpcApiProviderOptions = {
-  batchMaxCount: 1, // Disable batching to avoid rate limits
-  batchStallTime: 2000, // Wait 2s before batching
-  staticNetwork: Network.from(137),
-  polling: false, // Disable automatic polling
-};
+interface AccountState {
+  smartWalletAddress: string;
+  defaultAddress: string;
+  deployed: boolean;
+  eoaBalance: bigint;
+  smartWalletBalance: bigint;
+  token: (TokenInfo & { balance: bigint }) | null;
+  // Native amount the signer should hold to deploy (if needed) and transfer
+  suggestedGas: bigint;
+}
 
 // Rate limiting configuration
 const RATE_LIMIT_CONFIG = {
   slotInterval: 1000, // Wait 1 second between requests
   maxAttempts: 3, // Retry up to 3 times on failure
-  retryDelay: 2000, // Wait 2 seconds before retry
 };
 
 // Cache providers to reuse throttled instances
@@ -81,406 +107,334 @@ const buildFetchRequest = (url: string): FetchRequest => {
   return req;
 };
 
-const getProvider = (url: string): JsonRpcProvider => {
-  // Reuse cached provider if available (with throttling already configured)
-  if (providerCache.has(url)) {
-    return providerCache.get(url)!;
-  }
+const getProvider = (url: string, chainId: number): JsonRpcProvider => {
+  const key = `${chainId}:${url}`;
+  const cached = providerCache.get(key);
+  if (cached) return cached;
 
-  // Create new provider with rate limiting
-  const provider = new JsonRpcProvider(
-    buildFetchRequest(url),
-    Network.from(137),
-    defaultRpcOptions
-  );
-
-  // Cache the provider
-  providerCache.set(url, provider);
+  const network = Network.from(chainId);
+  const provider = new JsonRpcProvider(buildFetchRequest(url), network, {
+    batchMaxCount: 1, // Disable batching to avoid rate limits
+    staticNetwork: network,
+    polling: false,
+  });
+  providerCache.set(key, provider);
   return provider;
 };
 
-// Clear provider cache when RPC changes
-const clearProviderCache = (exceptUrl?: string) => {
-  if (exceptUrl) {
-    const keepProvider = providerCache.get(exceptUrl);
-    providerCache.clear();
-    if (keepProvider) {
-      providerCache.set(exceptUrl, keepProvider);
-    }
-  } else {
-    providerCache.clear();
+const hasCode = async (provider: JsonRpcProvider, address: string) =>
+  (await provider.getCode(address)) !== "0x";
+
+const shorten = (address: string) =>
+  `${address.slice(0, 6)}...${address.slice(-4)}`;
+
+const describeError = (err: unknown): string => {
+  const error = err as DefaultError;
+  if (error.code === "CALL_EXCEPTION") {
+    return "Smart wallet execution reverted. Make sure the signer is the owner of this smart wallet.";
   }
+  if (error.code === "INSUFFICIENT_FUNDS") {
+    return "Insufficient funds for gas fees.";
+  }
+  return error.shortMessage || error.message || String(err);
 };
 
-const USDTTransferApp: React.FC = () => {
+const sortedChains = (showTestnets: boolean) =>
+  SUPPORTED_CHAINS.filter((c) => showTestnets || !c.testnet);
+
+type StepStatus = "done" | "current" | "pending";
+
+// One numbered step of the recovery flow: explanation on top, controls below
+const Step: React.FC<{
+  number: number;
+  status: StepStatus;
+  title: string;
+  description: React.ReactNode;
+  children?: React.ReactNode;
+}> = ({ number, status, title, description, children }) => (
+  <section className="flex gap-3">
+    <span
+      className={`flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold ${
+        status === "done"
+          ? "bg-green-600 text-white"
+          : status === "current"
+            ? "bg-purple-600 text-white"
+            : "bg-gray-200 text-gray-600"
+      }`}
+    >
+      {status === "done" ? <Check className="w-4 h-4" /> : number}
+    </span>
+    <div className="flex-1 min-w-0 space-y-4">
+      <div>
+        <h2
+          className={`text-base font-semibold ${
+            status === "pending" ? "text-gray-500" : "text-gray-900"
+          }`}
+        >
+          {title}
+        </h2>
+        <p className="text-xs text-gray-600 mt-1">{description}</p>
+      </div>
+      {children}
+    </div>
+  </section>
+);
+
+const ModularAccountApp: React.FC = () => {
+  const [showTestnets, setShowTestnets] = useState(false);
+  const [chainId, setChainId] = useState<number>(DEFAULT_CHAIN_ID);
+  const [selectedRpc, setSelectedRpc] = useState<string>("");
+  const [customRpc, setCustomRpc] = useState("");
+
   const [mnemonic, setMnemonic] = useState("");
-  const [smartWalletAddress, setSmartWalletAddress] = useState("");
+  const [addressOverride, setAddressOverride] = useState("");
+  const [signer, setSigner] = useState<Wallet | null>(null);
+  const [account, setAccount] = useState<AccountState | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  const [asset, setAsset] = useState<string>(NATIVE_ASSET);
+  const [tokenAddress, setTokenAddress] = useState("");
   const [recipient, setRecipient] = useState("");
   const [amount, setAmount] = useState("");
+
   const [loading, setLoading] = useState(false);
+  const [loadingAccount, setLoadingAccount] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [txHash, setTxHash] = useState("");
-  const [walletInfo, setWalletInfo] = useState<WalletInfo | null>(null);
-  const [usdtBalance, setUsdtBalance] = useState<string | null>(null);
-  const [maticBalance, setMaticBalance] = useState<string | null>(null);
-  const [loadingBalance, setLoadingBalance] = useState(false);
   const [estimatedGas, setEstimatedGas] = useState<string | null>(null);
-  const [rpcOptions, setRpcOptions] = useState<RpcOption[]>([
-    { name: DEFAULT_RPC, url: DEFAULT_RPC },
-  ]);
-  const [selectedRpc, setSelectedRpc] = useState<string>(DEFAULT_RPC);
-  const [loadingRpc, setLoadingRpc] = useState<boolean>(true);
-  const previousRpcRef = useRef<string>("");
-  const reconnectAbortControllerRef = useRef<AbortController | null>(null);
-  const balanceAbortControllerRef = useRef<AbortController | null>(null);
-  const isReconnectingRef = useRef<boolean>(false);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const isFetchingBalancesRef = useRef<boolean>(false);
+  // Step whose action produced the current error / success message
+  const [messageStep, setMessageStep] = useState(2);
 
-  // Fetch public RPCs from Chainlist
+  const chain: SupportedChain = useMemo(
+    () =>
+      SUPPORTED_CHAINS.find((c) => c.chainId === chainId) ??
+      SUPPORTED_CHAINS[0],
+    [chainId],
+  );
+  const rpcUrl = selectedRpc === CUSTOM_RPC ? customRpc.trim() : selectedRpc;
+  const nativeSymbol = chain.nativeSymbol;
+  // asset is NATIVE_ASSET, CUSTOM_TOKEN or the address of a known token
+  const erc20Address =
+    asset === NATIVE_ASSET
+      ? null
+      : asset === CUSTOM_TOKEN
+        ? tokenAddress.trim() || null
+        : asset;
+
+  // Reset the RPC selection whenever the chain changes
   useEffect(() => {
-    const fetchChainlistRPCs = async () => {
+    setSelectedRpc(chain.rpcs[0] ?? CUSTOM_RPC);
+    setAccount(null);
+    setAsset(NATIVE_ASSET);
+    setTxHash("");
+    setSuccess("");
+    setEstimatedGas(null);
+  }, [chain]);
+
+  // Load smart wallet address, deployment status and balances for the
+  // current chain / RPC / token. Re-runs whenever any of them changes.
+  useEffect(() => {
+    if (!signer || !rpcUrl) return;
+    let cancelled = false;
+
+    const load = async () => {
+      setLoadingAccount(true);
+      setError("");
       try {
-        setLoadingRpc(true);
-        // Chainlist API endpoint for Polygon (chainId: 137)
-        const response = await fetch("https://chainid.network/chains.json");
-        const chains = await response.json();
-        interface ChainInfo {
-          chainId: number;
-          rpc: string[];
+        const provider = getProvider(rpcUrl, chain.chainId);
+        const [factoryDeployed, implDeployed] = await Promise.all([
+          hasCode(provider, FACTORY_ADDRESS),
+          hasCode(provider, SEMI_MODULAR_ACCOUNT_IMPL),
+        ]);
+        if (!factoryDeployed || !implDeployed) {
+          throw new Error(
+            `Modular Account V2 contracts are not deployed on ${chain.name}.`,
+          );
         }
-        const polygon = chains.find(
-          (chain: ChainInfo) => chain.chainId === 137
+
+        const factory = new Contract(FACTORY_ADDRESS, FACTORY_ABI, provider);
+        const defaultAddress: string = await factory.getAddressSemiModular(
+          signer.address,
+          ACCOUNT_SALT,
         );
+        const smartWalletAddress = addressOverride.trim()
+          ? getAddress(addressOverride.trim())
+          : defaultAddress;
 
-        if (polygon && polygon.rpc && Array.isArray(polygon.rpc)) {
-          // Filter only public HTTPS RPCs (no API keys, no authentication)
-          const publicRPCs = polygon.rpc
-            .filter((rpc: string) => {
-              const url = typeof rpc === "string" ? rpc : "";
-              return (
-                url.startsWith("https://") &&
-                !url.includes("${") &&
-                !url.includes("apiKey") &&
-                !url.includes("apikey") &&
-                !url.includes("API_KEY") &&
-                !url.includes("key=") &&
-                !url.includes("auth") &&
-                !url.includes("demo") &&
-                !url.includes("test")
-              );
-            })
-            .map((rpc: string) => {
-              const url = typeof rpc === "string" ? rpc : "";
-              // Use URL as name
-              return { name: url, url };
-            })
-            .filter(
-              (rpc: RpcOption, index: number, self: RpcOption[]) =>
-                index === self.findIndex((t) => t.url === rpc.url)
-            ) // Remove duplicates
-            .slice(0, 10); // Limit to 10 RPCs
+        const [deployed, eoaBalance, smartWalletBalance, feeData] =
+          await Promise.all([
+            hasCode(provider, smartWalletAddress),
+            provider.getBalance(signer.address),
+            provider.getBalance(smartWalletAddress),
+            provider.getFeeData(),
+          ]);
+        const gasUnits =
+          (deployed ? 0n : DEPLOY_GAS_UNITS) + TRANSFER_GAS_UNITS;
+        const suggestedGas =
+          (gasUnits *
+            (feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n) *
+            SUGGESTED_GAS_MARGIN_PCT) /
+          100n;
 
-          if (publicRPCs.length > 0) {
-            setRpcOptions(publicRPCs);
-            setSelectedRpc(publicRPCs[0].url);
-          }
+        let token: AccountState["token"] = null;
+        if (erc20Address && isAddress(erc20Address)) {
+          const erc20 = new Contract(erc20Address, ERC20_ABI, provider);
+          const [symbol, decimals, balance] = await Promise.all([
+            erc20.symbol(),
+            erc20.decimals(),
+            erc20.balanceOf(smartWalletAddress),
+          ]);
+          token = {
+            address: getAddress(erc20Address),
+            symbol,
+            decimals: Number(decimals),
+            balance,
+          };
         }
+
+        if (cancelled) return;
+        setAccount({
+          smartWalletAddress,
+          defaultAddress,
+          deployed,
+          eoaBalance,
+          smartWalletBalance,
+          token,
+          suggestedGas,
+        });
       } catch (err) {
-        console.error("Failed to fetch RPCs from Chainlist:", err);
-        // Keep default RPC on error
-        setRpcOptions([{ name: DEFAULT_RPC, url: DEFAULT_RPC }]);
+        if (cancelled) return;
+        setAccount(null);
+        setMessageStep(2);
+        setError("Failed to load wallet: " + describeError(err));
       } finally {
-        setLoadingRpc(false);
+        if (!cancelled) setLoadingAccount(false);
       }
     };
 
-    fetchChainlistRPCs();
-  }, []);
-
-  // Reconnect wallet when RPC changes (if wallet is already imported)
-  useEffect(() => {
-    // Clear any pending timeout
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-
-    // Cancel any ongoing reconnection and balance fetches
-    if (reconnectAbortControllerRef.current) {
-      reconnectAbortControllerRef.current.abort();
-      reconnectAbortControllerRef.current = null;
-    }
-    if (balanceAbortControllerRef.current) {
-      balanceAbortControllerRef.current.abort();
-      balanceAbortControllerRef.current = null;
-    }
-
-    // Clear provider cache when RPC changes (keep current RPC provider)
-    if (
-      previousRpcRef.current !== "" &&
-      previousRpcRef.current !== selectedRpc
-    ) {
-      clearProviderCache(selectedRpc);
-    }
-
-    // Only reconnect if RPC actually changed and wallet is imported
-    if (
-      walletInfo &&
-      mnemonic.trim() &&
-      previousRpcRef.current !== "" &&
-      previousRpcRef.current !== selectedRpc &&
-      !isReconnectingRef.current
-    ) {
-      // Update the previous RPC reference immediately to prevent loops
-      previousRpcRef.current = selectedRpc;
-      isReconnectingRef.current = true;
-
-      // Debounce the reconnection to avoid rapid changes
-      reconnectTimeoutRef.current = setTimeout(() => {
-        const abortController = new AbortController();
-        reconnectAbortControllerRef.current = abortController;
-
-        const reconnectWallet = async () => {
-          try {
-            // Check if still valid (RPC hasn't changed again)
-            if (
-              previousRpcRef.current !== selectedRpc ||
-              abortController.signal.aborted
-            ) {
-              return;
-            }
-
-            setError(""); // Clear previous errors
-
-            const provider = getProvider(selectedRpc);
-            const wallet = Wallet.fromPhrase(mnemonic);
-            const signer = wallet.connect(provider);
-
-            // Check if aborted
-            if (abortController.signal.aborted) {
-              return;
-            }
-
-            setWalletInfo({
-              eoaAddress: wallet.address,
-              smartWalletAddress: walletInfo.smartWalletAddress,
-              signer: signer as unknown as Wallet,
-            });
-
-            // Check if aborted before fetching balances
-            if (abortController.signal.aborted) {
-              return;
-            }
-
-            // Update balances with new RPC, passing the abort signal
-            await getBalances(
-              walletInfo.smartWalletAddress,
-              wallet.address,
-              selectedRpc,
-              abortController.signal
-            );
-          } catch (err) {
-            // Don't set error if aborted
-            if (abortController.signal.aborted) {
-              return;
-            }
-            const message = err instanceof Error ? err.message : String(err);
-            setError("Failed to reconnect with new RPC: " + message);
-          } finally {
-            if (!abortController.signal.aborted) {
-              isReconnectingRef.current = false;
-            }
-            if (reconnectAbortControllerRef.current === abortController) {
-              reconnectAbortControllerRef.current = null;
-            }
-          }
-        };
-
-        reconnectWallet();
-      }, 500); // 500ms debounce
-    } else if (previousRpcRef.current === "") {
-      // First time, just update the reference
-      previousRpcRef.current = selectedRpc;
-    }
-
-    // Cleanup function
+    // Debounce so typing a custom RPC or token address doesn't spam requests
+    const timeout = setTimeout(load, 400);
     return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-      if (reconnectAbortControllerRef.current) {
-        reconnectAbortControllerRef.current.abort();
-        reconnectAbortControllerRef.current = null;
-      }
-      if (balanceAbortControllerRef.current) {
-        balanceAbortControllerRef.current.abort();
-        balanceAbortControllerRef.current = null;
-      }
-      isReconnectingRef.current = false;
-      isFetchingBalancesRef.current = false;
+      cancelled = true;
+      clearTimeout(timeout);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedRpc]);
+  }, [signer, rpcUrl, chain, addressOverride, erc20Address, refreshNonce]);
 
-  const validateInputs = (): boolean => {
-    if (!mnemonic.trim()) {
-      setError("Please enter your mnemonic phrase");
-      return false;
-    }
-    if (!smartWalletAddress.trim() || !smartWalletAddress.startsWith("0x")) {
-      setError("Please enter a valid smart wallet address");
-      return false;
-    }
-    if (!recipient.trim() || !recipient.startsWith("0x")) {
-      setError("Please enter a valid recipient address");
-      return false;
-    }
-    if (!amount || parseFloat(amount) <= 0) {
-      setError("Please enter a valid amount");
-      return false;
-    }
-    return true;
-  };
+  const refresh = useCallback(() => setRefreshNonce((n) => n + 1), []);
 
-  const getBalances = async (
-    address: string,
-    eoaAddress: string,
-    rpcUrl?: string,
-    signal?: AbortSignal
-  ): Promise<void> => {
-    // Cancel any ongoing balance fetch
-    if (balanceAbortControllerRef.current) {
-      balanceAbortControllerRef.current.abort();
-      balanceAbortControllerRef.current = null;
-    }
-
-    // Prevent multiple simultaneous calls
-    if (isFetchingBalancesRef.current) {
-      console.log("Balance fetch already in progress, skipping...");
-      return;
-    }
-
-    isFetchingBalancesRef.current = true;
-    const abortController = new AbortController();
-    balanceAbortControllerRef.current = abortController;
-
-    // Use provided signal or create a combined one
-    const finalSignal = signal || abortController.signal;
-
-    setLoadingBalance(true);
-    try {
-      const rpc = rpcUrl || selectedRpc;
-      console.log("Fetching balances for:", address, "using RPC:", rpc);
-      const provider = getProvider(rpc);
-
-      // Check if aborted before making requests
-      if (finalSignal.aborted) {
-        return;
-      }
-
-      // Get USDT balance
-      const usdtContract = new Contract(
-        USDT_POLYGON_ADDRESS,
-        USDT_ABI,
-        provider
-      );
-      const balance = await usdtContract.balanceOf(address);
-
-      // Check if aborted
-      if (finalSignal.aborted) {
-        return;
-      }
-
-      const decimals = await usdtContract.decimals();
-      const formattedBalance = formatUnits(balance, decimals);
-
-      // Check if aborted before setting state
-      if (finalSignal.aborted) {
-        return;
-      }
-
-      setUsdtBalance(formattedBalance);
-
-      // Get MATIC balance
-      const maticBalanceWei = await provider.getBalance(eoaAddress);
-
-      // Check if aborted
-      if (finalSignal.aborted) {
-        return;
-      }
-
-      const formattedMaticBalance = formatEther(maticBalanceWei);
-
-      // Check if aborted before setting state
-      if (finalSignal.aborted) {
-        return;
-      }
-
-      setMaticBalance(formattedMaticBalance);
-    } catch (err) {
-      // Don't set error if aborted
-      if (finalSignal.aborted) {
-        return;
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      setError("Failed to fetch balances: " + message);
-    } finally {
-      isFetchingBalancesRef.current = false;
-      if (!finalSignal.aborted) {
-        setLoadingBalance(false);
-      }
-      if (balanceAbortControllerRef.current === abortController) {
-        balanceAbortControllerRef.current = null;
-      }
-    }
-  };
-
-  const handleImportWallet = async (): Promise<void> => {
-    if (!mnemonic.trim()) {
-      setError("Please enter your mnemonic phrase");
-      return;
-    }
-    if (!smartWalletAddress.trim() || !smartWalletAddress.startsWith("0x")) {
-      setError("Please enter a valid smart wallet address");
-      return;
-    }
-
+  const handleImportWallet = (): void => {
+    setMessageStep(2);
     setError("");
     setSuccess("");
-    setLoading(true);
-
+    if (!mnemonic.trim()) {
+      setError("Please enter your mnemonic phrase");
+      return;
+    }
+    if (addressOverride.trim() && !isAddress(addressOverride.trim())) {
+      setError("Please enter a valid smart wallet address or leave it empty");
+      return;
+    }
+    if (!rpcUrl) {
+      setError("Please select or enter an RPC endpoint");
+      return;
+    }
     try {
-      const provider = getProvider(selectedRpc);
-      const wallet = Wallet.fromPhrase(mnemonic);
-      const signer = wallet.connect(provider);
-
-      setWalletInfo({
-        eoaAddress: wallet.address,
-        smartWalletAddress: smartWalletAddress,
-        signer: signer as unknown as Wallet,
-      });
-
-      // Update RPC reference when wallet is first imported
-      previousRpcRef.current = selectedRpc;
-
-      await getBalances(smartWalletAddress, wallet.address);
-
-      setSuccess("Wallet imported successfully!");
+      setSigner(Wallet.fromPhrase(mnemonic.trim()) as unknown as Wallet);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setError("Failed to import wallet: " + message);
+      setError("Failed to import wallet: " + describeError(err));
+    }
+  };
+
+  const handleDisconnect = (): void => {
+    setSigner(null);
+    setAccount(null);
+    setError("");
+    setSuccess("");
+    setTxHash("");
+    setEstimatedGas(null);
+  };
+
+  // Sends a transaction from the signer EOA after checking it can cover gas
+  const sendFromSigner = async (
+    to: string,
+    data: string,
+    description: string,
+  ): Promise<void> => {
+    if (!signer || !account) return;
+    const provider = getProvider(rpcUrl, chain.chainId);
+    const connected = signer.connect(provider);
+
+    const [gasEstimate, feeData] = await Promise.all([
+      provider.estimateGas({ from: signer.address, to, data }),
+      provider.getFeeData(),
+    ]);
+    const gasLimit = (gasEstimate * GAS_LIMIT_MARGIN_PCT) / 100n;
+    const maxFeePerGas =
+      ((feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n) * FEE_MARGIN_PCT) /
+      100n;
+    const estimatedCost = gasLimit * maxFeePerGas;
+    setEstimatedGas(formatEther(estimatedCost));
+
+    if (account.eoaBalance < estimatedCost) {
+      throw new Error(
+        `Insufficient ${nativeSymbol} for gas fees. Signer has ${formatEther(
+          account.eoaBalance,
+        )} ${nativeSymbol} but needs approximately ${formatEther(
+          estimatedCost,
+        )} ${nativeSymbol}.`,
+      );
+    }
+
+    const tx = await connected.sendTransaction({ to, data, gasLimit });
+    console.log(`${description} sent:`, tx.hash);
+    setTxHash(tx.hash);
+    const receipt = await tx.wait();
+    if (!receipt || receipt.status !== 1) {
+      throw new Error(`${description} reverted (tx ${tx.hash})`);
+    }
+  };
+
+  const handleDeploy = async (): Promise<void> => {
+    if (!signer || !account) return;
+    setMessageStep(4);
+    setError("");
+    setSuccess("");
+    setTxHash("");
+    setEstimatedGas(null);
+    setLoading(true);
+    try {
+      const data = new Interface(FACTORY_ABI).encodeFunctionData(
+        "createSemiModularAccount",
+        [signer.address, ACCOUNT_SALT],
+      );
+      await sendFromSigner(FACTORY_ADDRESS, data, "Deploy");
+      setSuccess(`Smart wallet deployed on ${chain.name}!`);
+      refresh();
+    } catch (err) {
+      console.error("Deploy error:", err);
+      setError("Deploy failed: " + describeError(err));
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSendUSDT = async (): Promise<void> => {
-    if (!validateInputs()) return;
-    if (!walletInfo) {
+  const handleSend = async (): Promise<void> => {
+    setMessageStep(5);
+    if (!signer || !account) {
       setError("Please import your wallet first");
+      return;
+    }
+    if (!isAddress(recipient.trim())) {
+      setError("Please enter a valid recipient address");
+      return;
+    }
+    if (!amount || parseFloat(amount) <= 0) {
+      setError("Please enter a valid amount");
+      return;
+    }
+    if (asset !== NATIVE_ASSET && !account.token) {
+      setError("Please enter a valid ERC20 token address");
       return;
     }
 
@@ -491,104 +445,158 @@ const USDTTransferApp: React.FC = () => {
     setLoading(true);
 
     try {
-      const provider = getProvider(selectedRpc);
-      const { signer } = walletInfo;
-
-      // Encode USDT transfer
-      const iface = new Interface(USDT_ABI);
-      const amountInSmallestUnit = parseUnits(amount, 6); // USDT has 6 decimals
-
-      // check if the amount is greater than the balance
-      if (amountInSmallestUnit > parseUnits(usdtBalance || "0", 6)) {
-        setError("Insufficient USDT balance");
-        setLoading(false);
-        return;
-      }
-      const data = iface.encodeFunctionData("transfer", [
-        recipient,
-        amountInSmallestUnit,
-      ]);
-
-      // Connect to smart wallet contract
-      const smartWallet = new Contract(
-        smartWalletAddress,
-        SMART_WALLET_ABI,
-        signer
-      );
-
-      // Estimate gas fees
-      const feeData = await provider.getFeeData();
-      const gasLimit = 200000n; // Estimate for execute call
-      // gas + 20% margin
-      const maxFeePerGas =
-        ((feeData.maxFeePerGas || feeData.gasPrice || 0n) * 200n) / 100n;
-      const estimatedGasCost = gasLimit * maxFeePerGas;
-      const estimatedGasCostInMatic = formatEther(estimatedGasCost);
-
-      setEstimatedGas(estimatedGasCostInMatic);
-
-      // Check if user has enough MATIC for gas
-      const maticBalanceBigInt = parseEther(maticBalance || "0");
-      if (maticBalanceBigInt < estimatedGasCost) {
-        setError(
-          `Insufficient MATIC for gas fees. You have ${maticBalance} MATIC but need approximately ${estimatedGasCostInMatic} MATIC for this transaction.`
-        );
-        setLoading(false);
-        return;
+      const to = getAddress(recipient.trim());
+      const token = asset === NATIVE_ASSET ? null : account.token!;
+      const symbol = token?.symbol ?? nativeSymbol;
+      const value = parseUnits(amount, token?.decimals ?? 18);
+      const available = token?.balance ?? account.smartWalletBalance;
+      if (value > available) {
+        throw new Error(`Insufficient ${symbol} balance in the smart wallet`);
       }
 
-      console.log("Executing USDT transfer through smart wallet...");
+      // Native transfers send value directly; ERC20 transfers call the token
+      const [target, callValue, callData] = token
+        ? [
+            token.address,
+            0n,
+            new Interface(ERC20_ABI).encodeFunctionData("transfer", [
+              to,
+              value,
+            ]),
+          ]
+        : [to, value, "0x"];
 
-      // Execute the transaction through the smart wallet
-      const tx = await smartWallet.execute(
-        USDT_POLYGON_ADDRESS,
-        0, // value in native token (0 for ERC20 transfers)
-        data,
-        {
-          gasLimit: gasLimit,
-        }
+      const data = new Interface(SMART_WALLET_ABI).encodeFunctionData(
+        "execute",
+        [target, callValue, callData],
       );
 
-      console.log("Transaction sent:", tx.hash);
-
-      // Wait for confirmation
-      const receipt = await tx.wait();
-      console.log("Transaction confirmed:", receipt.hash);
-
-      setTxHash(receipt.hash);
+      await sendFromSigner(account.smartWalletAddress, data, "Transfer");
       setSuccess(
-        `Transaction successful! ${amount} USDT sent to ${recipient.substr(
-          0,
-          6
-        )}...${recipient.substr(-4)}`
+        `Transaction successful! ${amount} ${symbol} sent to ${shorten(to)}`,
       );
-
-      // Refresh balances
-      await getBalances(smartWalletAddress, walletInfo.eoaAddress);
-
       setAmount("");
       setRecipient("");
+      refresh();
     } catch (err) {
       console.error("Transaction error:", err);
-      const error = err as DefaultError;
-      const message = error.message;
-      const code = error.code;
-      // Better error messages
-      let errorMsg = "Transaction failed: ";
-      if (code === "CALL_EXCEPTION") {
-        errorMsg +=
-          "Smart wallet execution failed. Make sure your wallet supports the execute() function.";
-      } else if (message.includes("insufficient funds")) {
-        errorMsg += "Insufficient funds for gas fees.";
-      } else {
-        errorMsg += message;
-      }
-
-      setError(errorMsg);
+      setError("Transaction failed: " + describeError(err));
     } finally {
       setLoading(false);
     }
   };
+
+  const explorerTxUrl =
+    chain.explorer && txHash ? `${chain.explorer}/tx/${txHash}` : null;
+  const explorerAddressUrl = (address: string) =>
+    chain.explorer ? `${chain.explorer}/address/${address}` : null;
+
+  const canDeploy =
+    account &&
+    !account.deployed &&
+    account.smartWalletAddress === account.defaultAddress;
+
+  const [copied, setCopied] = useState(false);
+  const copySignerAddress = async () => {
+    if (!signer) return;
+    await navigator.clipboard.writeText(signer.address);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  // Each step is done, the current one (first not done) or still pending
+  const hasGas = !!account && account.eoaBalance >= account.suggestedGas;
+  const stepsDone = [
+    !!signer,
+    !!account,
+    hasGas,
+    !!account?.deployed,
+    false,
+  ];
+  const currentStep = stepsDone.findIndex((done) => !done);
+  const stepStatus = (index: number): StepStatus =>
+    stepsDone[index] ? "done" : index === currentStep ? "current" : "pending";
+
+  const inputClass =
+    "w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all bg-white";
+  const primaryButtonClass =
+    "w-full py-3 px-4 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg";
+
+  const renderAddress = (address: string) => {
+    const url = explorerAddressUrl(address);
+    return url ? (
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-sm font-mono text-gray-800 break-all hover:text-purple-600"
+      >
+        {address}
+      </a>
+    ) : (
+      <p className="text-sm font-mono text-gray-800 break-all">{address}</p>
+    );
+  };
+
+  // Error / success feedback, shown under the step that triggered it
+  const renderMessages = (step: number) =>
+    messageStep !== step ? null : (
+      <>
+        {error && (
+          <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-red-800 break-words min-w-0">{error}</p>
+          </div>
+        )}
+        {estimatedGas && (
+          <p className="text-xs text-gray-600">
+            Estimated gas fee:{" "}
+            <span className="font-semibold text-gray-800">
+              ~{parseFloat(estimatedGas).toFixed(6)} {nativeSymbol}
+            </span>
+          </p>
+        )}
+        {(success || (loading && txHash)) && (
+          <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
+            {success && (
+              <div className="flex items-start gap-3 mb-2">
+                <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
+                <p className="text-sm text-green-800">{success}</p>
+              </div>
+            )}
+            {loading && txHash && (
+              <p className="text-sm text-green-800">
+                Waiting for confirmation...
+              </p>
+            )}
+            {explorerTxUrl && (
+              <a
+                href={explorerTxUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-2 text-sm text-purple-600 hover:text-purple-700 font-medium mt-2"
+              >
+                View on explorer
+                <ExternalLink className="w-4 h-4" />
+              </a>
+            )}
+          </div>
+        )}
+      </>
+    );
+
+  const refreshButton = (
+    <button
+      onClick={refresh}
+      disabled={loading || loadingAccount}
+      title="Refresh balances"
+      className="p-1 text-purple-600 hover:text-purple-800 disabled:opacity-50"
+    >
+      <RefreshCw
+        className={`w-4 h-4 ${loadingAccount ? "animate-spin" : ""}`}
+      />
+    </button>
+  );
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-indigo-900 flex items-center justify-center p-4">
@@ -599,267 +607,441 @@ const USDTTransferApp: React.FC = () => {
               <Send className="w-8 h-8 text-purple-600" />
             </div>
             <h1 className="text-3xl font-bold text-gray-800 mb-2">
-              USDT Transfer
+              Modular Account V2
             </h1>
-            <p className="text-gray-600">Send USDT on Polygon Network</p>
-            <p className="text-xs text-purple-600 mt-2">(Modular Account V2)</p>
+            <p className="text-gray-600">
+              Recover the tokens in your smart wallet, step by step
+            </p>
           </div>
 
-          {error && (
-            <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-              <p className="text-sm text-red-800">{error}</p>
-            </div>
-          )}
-
-          {success && (
-            <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg">
-              <div className="flex items-start gap-3 mb-2">
-                <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
-                <p className="text-sm text-green-800">{success}</p>
-              </div>
-              {txHash && (
-                <a
-                  href={`https://polygonscan.com/tx/${txHash}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-2 text-sm text-purple-600 hover:text-purple-700 font-medium mt-2"
-                >
-                  View on PolygonScan
-                  <ExternalLink className="w-4 h-4" />
-                </a>
-              )}
-            </div>
-          )}
-
-          <div className="space-y-6">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                RPC Endpoint (Public from Chainlist)
-              </label>
-              {loadingRpc ? (
-                <div className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-gray-50 flex items-center gap-2">
-                  <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
-                  <span className="text-sm text-gray-600">
-                    Loading RPCs from Chainlist...
-                  </span>
+          <div className="space-y-8">
+            <Step
+              number={1}
+              status={stepStatus(0)}
+              title="Choose the network"
+              description="Select the network where your tokens are. Your smart wallet has the same address on every network, but each network must be recovered separately."
+            >
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Network
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-gray-600">
+                    <input
+                      type="checkbox"
+                      checked={showTestnets}
+                      onChange={(e) => setShowTestnets(e.target.checked)}
+                      disabled={loading}
+                    />
+                    Show testnets
+                  </label>
                 </div>
-              ) : (
                 <select
-                  value={selectedRpc}
-                  onChange={(e) => setSelectedRpc(e.target.value)}
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all bg-white"
+                  value={chain.chainId}
+                  onChange={(e) => setChainId(Number(e.target.value))}
+                  className={inputClass}
                   disabled={loading}
                 >
-                  {rpcOptions.map((rpc, index) => (
-                    <option key={index} value={rpc.url}>
-                      {rpc.name}
+                  {sortedChains(showTestnets || chain.testnet).map((c) => (
+                    <option key={c.chainId} value={c.chainId}>
+                      {c.name} ({c.chainId})
                     </option>
                   ))}
                 </select>
-              )}
-              <p className="text-xs text-gray-500 mt-1">
-                Current:{" "}
-                {rpcOptions.find((rpc) => rpc.url === selectedRpc)?.name ||
-                  selectedRpc}
-              </p>
-            </div>
+              </div>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Mnemonic Phrase
-              </label>
-              <textarea
-                value={mnemonic}
-                onChange={(e) => setMnemonic(e.target.value)}
-                placeholder="Enter your 12 or 24 word mnemonic phrase"
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all resize-none"
-                rows={3}
-                disabled={loading || !!walletInfo}
-              />
-            </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  RPC Endpoint
+                </label>
+                <select
+                  value={selectedRpc}
+                  onChange={(e) => setSelectedRpc(e.target.value)}
+                  className={inputClass}
+                  disabled={loading}
+                >
+                  {chain.rpcs.map((url) => (
+                    <option key={url} value={url}>
+                      {url}
+                    </option>
+                  ))}
+                  <option value={CUSTOM_RPC}>Custom RPC...</option>
+                </select>
+                {selectedRpc === CUSTOM_RPC && (
+                  <input
+                    type="text"
+                    value={customRpc}
+                    onChange={(e) => setCustomRpc(e.target.value)}
+                    placeholder="https://..."
+                    className={`${inputClass} mt-2`}
+                    disabled={loading}
+                  />
+                )}
+              </div>
+            </Step>
 
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Smart Wallet Address
-              </label>
-              <input
-                type="text"
-                value={smartWalletAddress}
-                onChange={(e) => setSmartWalletAddress(e.target.value)}
-                placeholder="0x..."
-                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-                disabled={loading || !!walletInfo}
-              />
-            </div>
+            <Step
+              number={2}
+              status={stepStatus(1)}
+              title="Import your wallet"
+              description={
+                <>
+                  Paste your mnemonic phrase. The app then shows your{" "}
+                  <strong>Smart Wallet</strong>, which holds your tokens, and
+                  your <strong>Signer Wallet</strong>, which controls it and
+                  pays the network fees.
+                </>
+              }
+            >
+              {!signer ? (
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Mnemonic Phrase
+                    </label>
+                    <textarea
+                      value={mnemonic}
+                      onChange={(e) => setMnemonic(e.target.value)}
+                      placeholder="Enter your 12 or 24 word mnemonic phrase"
+                      className={`${inputClass} resize-none`}
+                      rows={3}
+                      disabled={loading}
+                    />
+                  </div>
 
-            {!walletInfo ? (
-              <button
-                onClick={handleImportWallet}
-                disabled={loading}
-                className="w-full py-3 px-4 bg-purple-600 hover:bg-purple-700 text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-              >
-                {loading ? (
-                  <>
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    Importing...
-                  </>
-                ) : (
-                  <>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Smart Wallet Address{" "}
+                      <span className="font-normal text-gray-500">
+                        (optional)
+                      </span>
+                    </label>
+                    <input
+                      type="text"
+                      value={addressOverride}
+                      onChange={(e) => setAddressOverride(e.target.value)}
+                      placeholder="Leave empty to use the default for this signer"
+                      className={inputClass}
+                      disabled={loading}
+                    />
+                  </div>
+
+                  {renderMessages(2)}
+
+                  <button
+                    onClick={handleImportWallet}
+                    disabled={loading}
+                    className="w-full py-3 px-4 bg-purple-600 hover:bg-purple-700 text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
                     <LucideWallet className="w-5 h-5" />
                     Import Wallet
-                  </>
-                )}
-              </button>
-            ) : (
-              <>
-                <div className="p-4 bg-purple-50 rounded-lg border border-purple-200 space-y-3">
-                  <div>
-                    <p className="text-xs text-gray-600 mb-1">
-                      Smart Wallet Address
-                    </p>
-                    <p className="text-sm font-mono text-gray-800 break-all">
-                      {walletInfo.smartWalletAddress}
-                    </p>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="p-4 bg-purple-50 rounded-lg border border-purple-200 space-y-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs text-gray-600 mb-1">
+                          Smart Wallet (holds your tokens)
+                        </p>
+                        {account ? (
+                          renderAddress(account.smartWalletAddress)
+                        ) : (
+                          <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
+                        )}
+                      </div>
+                      {refreshButton}
+                    </div>
+
+                    {account && (
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <p className="text-xs text-gray-600 mb-1">
+                            Balance
+                          </p>
+                          <p className="text-xl font-bold text-purple-600 break-all">
+                            {formatEther(account.smartWalletBalance)}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {nativeSymbol}
+                          </p>
+                        </div>
+                        {account.token && (
+                          <div>
+                            <p className="text-xs text-gray-600 mb-1">
+                              Token Balance
+                            </p>
+                            <p className="text-xl font-bold text-purple-600 break-all">
+                              {formatUnits(
+                                account.token.balance,
+                                account.token.decimals,
+                              )}
+                            </p>
+                            <p className="text-xs text-gray-500">
+                              {account.token.symbol}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <p className="text-xs text-gray-600 mb-1">USDT Balance</p>
-                      <p className="text-xl font-bold text-purple-600">
-                        {loadingBalance ? (
-                          <Loader2 className="w-4 h-4 animate-spin inline" />
-                        ) : (
-                          `${usdtBalance || "0"}`
-                        )}
-                      </p>
-                      <p className="text-xs text-gray-500">USDT</p>
-                    </div>
+                  {renderMessages(2)}
+
+                  <button
+                    onClick={handleDisconnect}
+                    disabled={loading}
+                    className="text-xs text-gray-500 hover:text-gray-800 disabled:opacity-50"
+                  >
+                    Use a different wallet
+                  </button>
+                </>
+              )}
+            </Step>
+
+            <Step
+              number={3}
+              status={stepStatus(2)}
+              title={`Add ${nativeSymbol} for gas to the Signer Wallet`}
+              description={
+                <>
+                  Network fees are always paid by the Signer Wallet. Do{" "}
+                  <strong>not</strong> send {nativeSymbol} to the Smart Wallet
+                  for gas. Anything left over stays in the Signer Wallet and can
+                  be withdrawn by importing the same mnemonic in a regular
+                  wallet.
+                </>
+              }
+            >
+              {account && signer && (
+                <div className="p-4 bg-purple-50 rounded-lg border border-purple-200 space-y-3">
+                  <p className="text-sm text-gray-800">
+                    Send about{" "}
+                    <strong>
+                      {Number(formatEther(account.suggestedGas)).toPrecision(2)}{" "}
+                      {nativeSymbol}
+                    </strong>{" "}
+                    on <strong>{chain.name}</strong> to:
+                  </p>
+                  <div className="flex items-center gap-2 rounded-md bg-white border border-gray-200 px-3 py-2">
+                    <span className="font-mono text-xs text-gray-800 break-all">
+                      {signer.address}
+                    </span>
+                    <button
+                      onClick={copySignerAddress}
+                      title="Copy address"
+                      className="p-1 text-purple-600 hover:text-purple-800 flex-shrink-0"
+                    >
+                      {copied ? (
+                        <Check className="w-4 h-4" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </button>
                   </div>
-                  <div className="mt-2">
+                  <div className="flex items-end justify-between gap-2">
                     <div>
                       <p className="text-xs text-gray-600 mb-1">
-                        Signer Wallet
+                        Signer Wallet balance
                       </p>
-                      <p className="text-sm font-mono text-gray-800 break-all">
-                        {walletInfo.eoaAddress}
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-gray-600 mb-1">
-                        MATIC Balance
-                      </p>
-                      <p className="text-xl font-bold text-indigo-600">
-                        {loadingBalance ? (
-                          <Loader2 className="w-4 h-4 animate-spin inline" />
-                        ) : (
-                          `${maticBalance || "0"}`
-                        )}
-                      </p>
-                      <p className="text-xs text-gray-500">MATIC</p>
-                    </div>
-                  </div>
-                  {estimatedGas && (
-                    <div className="pt-2 border-t border-purple-200">
-                      <p className="text-xs text-gray-600">
-                        Estimated Gas Fee:{" "}
-                        <span className="font-semibold text-gray-800">
-                          ~{parseFloat(estimatedGas).toFixed(6)} MATIC
+                      <p className="text-xl font-bold text-indigo-600 break-all">
+                        {formatEther(account.eoaBalance)}{" "}
+                        <span className="text-xs font-normal text-gray-500">
+                          {nativeSymbol}
                         </span>
                       </p>
                     </div>
+                    {refreshButton}
+                  </div>
+                  {!hasGas && (
+                    <p className="text-xs text-gray-600">
+                      After sending, click refresh to update the balance.
+                    </p>
                   )}
                 </div>
+              )}
+            </Step>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Recipient Address
-                  </label>
-                  <input
-                    type="text"
-                    value={recipient}
-                    onChange={(e) => setRecipient(e.target.value)}
-                    placeholder="0x..."
-                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-                    disabled={loading}
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">
-                    Amount (USDT)
-                  </label>
-                  <input
-                    type="number"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                    placeholder="0.00"
-                    step="0.01"
-                    min="0"
-                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent transition-all"
-                    disabled={loading}
-                  />
-                </div>
-
-                {error && (
-                  <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-start gap-3">
-                    <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-                    <p className="text-sm text-red-800">{error}</p>
-                  </div>
-                )}
-
-                {success && (
-                  <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg">
-                    <div className="flex items-start gap-3 mb-2">
-                      <CheckCircle className="w-5 h-5 text-green-600 flex-shrink-0 mt-0.5" />
-                      <p className="text-sm text-green-800">{success}</p>
-                    </div>
-                    {txHash && (
-                      <a
-                        href={`https://polygonscan.com/tx/${txHash}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 text-sm text-purple-600 hover:text-purple-700 font-medium mt-2"
-                      >
-                        View on PolygonScan
-                        <ExternalLink className="w-4 h-4" />
-                      </a>
-                    )}
-                  </div>
-                )}
-
-                <div className="mt-6 p-4 bg-info-50 border border-info-200 rounded-lg">
-                  <p className="text-xs text-info-800">
-                    <strong>Attention:</strong> You need to have enough MATIC in
-                    your Signer Wallet to cover the gas fee for the transaction.
+            <Step
+              number={4}
+              status={stepStatus(3)}
+              title="Deploy the Smart Wallet (if needed)"
+              description="Needed once per network, paid by the Signer Wallet. Your tokens are safe at the Smart Wallet address before and after deploying."
+            >
+              {account &&
+                (account.deployed ? (
+                  <p className="text-sm text-green-700">
+                    Your Smart Wallet is already deployed on {chain.name}.
                   </p>
-                </div>
-                <button
-                  onClick={handleSendUSDT}
-                  disabled={loading}
-                  className="w-full py-3 px-4 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-medium rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-lg"
-                >
-                  {loading ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      Sending...
-                    </>
-                  ) : (
-                    <>
-                      <Send className="w-5 h-5" />
-                      Send USDT
-                    </>
-                  )}
-                </button>
-              </>
-            )}
+                ) : canDeploy ? (
+                  <>
+                    {renderMessages(4)}
+                    <button
+                      onClick={handleDeploy}
+                      disabled={loading || loadingAccount}
+                      className={primaryButtonClass}
+                    >
+                      {loading ? (
+                        <>
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                          Deploying...
+                        </>
+                      ) : (
+                        <>
+                          <Rocket className="w-5 h-5" />
+                          Deploy Smart Wallet
+                        </>
+                      )}
+                    </button>
+                  </>
+                ) : (
+                  <p className="text-sm text-red-700">
+                    This address is not the default smart wallet for this
+                    signer, so it can't be deployed from here.
+                  </p>
+                ))}
+              {account?.deployed && renderMessages(4)}
+            </Step>
+
+            <Step
+              number={5}
+              status={account?.deployed ? "current" : "pending"}
+              title="Send your tokens"
+              description={`Choose the asset and where to send it, for example your exchange deposit address or another wallet you control. Make sure the recipient supports ${chain.name}. Repeat for each token and network.`}
+            >
+              {account?.deployed && (
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Asset
+                    </label>
+                    <select
+                      value={asset}
+                      onChange={(e) => setAsset(e.target.value)}
+                      className={inputClass}
+                      disabled={loading}
+                    >
+                      <option value={NATIVE_ASSET}>
+                        {nativeSymbol} (native)
+                      </option>
+                      {chain.tokens.map((token) => (
+                        <option key={token.address} value={token.address}>
+                          {token.symbol} ({token.name})
+                        </option>
+                      ))}
+                      <option value={CUSTOM_TOKEN}>Custom ERC20...</option>
+                    </select>
+                    {asset === CUSTOM_TOKEN && (
+                      <input
+                        type="text"
+                        value={tokenAddress}
+                        onChange={(e) => setTokenAddress(e.target.value)}
+                        placeholder="Token contract address 0x..."
+                        className={`${inputClass} mt-2`}
+                        disabled={loading}
+                      />
+                    )}
+                    <p className="text-xs text-gray-600 mt-1">
+                      Available:{" "}
+                      <strong>
+                        {asset === NATIVE_ASSET
+                          ? `${formatEther(account.smartWalletBalance)} ${nativeSymbol}`
+                          : account.token
+                            ? `${formatUnits(account.token.balance, account.token.decimals)} ${account.token.symbol}`
+                            : "-"}
+                      </strong>
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Recipient Address
+                    </label>
+                    <input
+                      type="text"
+                      value={recipient}
+                      onChange={(e) => setRecipient(e.target.value)}
+                      placeholder="0x..."
+                      className={inputClass}
+                      disabled={loading}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Amount (
+                      {asset === NATIVE_ASSET
+                        ? nativeSymbol
+                        : (account.token?.symbol ?? "token")}
+                      )
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        value={amount}
+                        onChange={(e) => setAmount(e.target.value)}
+                        placeholder="0.00"
+                        step="any"
+                        min="0"
+                        className={`${inputClass} pr-20 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none`}
+                        disabled={loading}
+                      />
+                      {/* Gas is paid by the signer, so the whole balance can be sent */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (asset === NATIVE_ASSET) {
+                            setAmount(formatEther(account.smartWalletBalance));
+                          } else if (account.token) {
+                            setAmount(
+                              formatUnits(
+                                account.token.balance,
+                                account.token.decimals,
+                              ),
+                            );
+                          }
+                        }}
+                        disabled={
+                          loading || (asset !== NATIVE_ASSET && !account.token)
+                        }
+                        className="absolute right-3 top-1/2 -translate-y-1/2 px-2 py-1 text-xs font-semibold text-purple-700 bg-purple-100 hover:bg-purple-200 rounded-md disabled:opacity-50"
+                      >
+                        MAX
+                      </button>
+                    </div>
+                  </div>
+
+                  {renderMessages(5)}
+
+                  <button
+                    onClick={handleSend}
+                    disabled={loading || loadingAccount}
+                    className={primaryButtonClass}
+                  >
+                    {loading ? (
+                      <>
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                        Sending...
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-5 h-5" />
+                        Send
+                      </>
+                    )}
+                  </button>
+                </>
+              )}
+            </Step>
           </div>
 
-          <div className="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+          <div className="mt-8 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
             <p className="text-xs text-yellow-800">
               <strong>⚠️ Security Warning:</strong> Never share your mnemonic
-              phrase with anyone. This app uses direct smart wallet execution
-              through the Polygon RPC.
+              phrase with anyone. This app runs entirely in your browser and
+              sends transactions directly from your signer wallet through the
+              selected RPC — no bundler or backend is involved.
             </p>
           </div>
         </div>
@@ -868,4 +1050,4 @@ const USDTTransferApp: React.FC = () => {
   );
 };
 
-export default USDTTransferApp;
+export default ModularAccountApp;
