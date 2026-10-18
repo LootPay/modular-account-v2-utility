@@ -139,6 +139,21 @@ const describeError = (err: unknown): string => {
   return error.shortMessage || error.message || String(err);
 };
 
+// A single word is a private key, several words a mnemonic
+const walletFromSecret = (secret: string): Wallet => {
+  const words = secret.trim().split(/\s+/);
+  if (words.length > 1) {
+    return Wallet.fromPhrase(words.join(" ")) as unknown as Wallet;
+  }
+  const key = words[0].startsWith("0x") ? words[0] : `0x${words[0]}`;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+    throw new Error(
+      "this is not a valid private key (64 hex characters) or mnemonic phrase"
+    );
+  }
+  return new Wallet(key);
+};
+
 const sortedChains = (showTestnets: boolean) =>
   SUPPORTED_CHAINS.filter((c) => showTestnets || !c.testnet);
 
@@ -186,7 +201,7 @@ const ModularAccountApp: React.FC = () => {
   const [selectedRpc, setSelectedRpc] = useState<string>("");
   const [customRpc, setCustomRpc] = useState("");
 
-  const [mnemonic, setMnemonic] = useState("");
+  const [secret, setSecret] = useState("");
   const [addressOverride, setAddressOverride] = useState("");
   const [signer, setSigner] = useState<Wallet | null>(null);
   const [account, setAccount] = useState<AccountState | null>(null);
@@ -327,8 +342,8 @@ const ModularAccountApp: React.FC = () => {
     setMessageStep(2);
     setError("");
     setSuccess("");
-    if (!mnemonic.trim()) {
-      setError("Please enter your mnemonic phrase");
+    if (!secret.trim()) {
+      setError("Please enter your private key or mnemonic phrase");
       return;
     }
     if (addressOverride.trim() && !isAddress(addressOverride.trim())) {
@@ -340,7 +355,7 @@ const ModularAccountApp: React.FC = () => {
       return;
     }
     try {
-      setSigner(Wallet.fromPhrase(mnemonic.trim()) as unknown as Wallet);
+      setSigner(walletFromSecret(secret));
     } catch (err) {
       setError("Failed to import wallet: " + describeError(err));
     }
@@ -686,7 +701,8 @@ const ModularAccountApp: React.FC = () => {
               title="Import your wallet"
               description={
                 <>
-                  Paste your mnemonic phrase. The app then shows your{" "}
+                  Paste your private key or your
+                  mnemonic phrase. The app then shows your{" "}
                   <strong>Smart Wallet</strong>, which holds your tokens, and
                   your <strong>Signer Wallet</strong>, which controls it and
                   pays the network fees.
@@ -697,12 +713,14 @@ const ModularAccountApp: React.FC = () => {
                 <>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Mnemonic Phrase
+                      Private Key or Mnemonic Phrase
                     </label>
                     <textarea
-                      value={mnemonic}
-                      onChange={(e) => setMnemonic(e.target.value)}
-                      placeholder="Enter your 12 or 24 word mnemonic phrase"
+                      value={secret}
+                      onChange={(e) => setSecret(e.target.value)}
+                      placeholder="0x… private key, or your 12 or 24 word mnemonic phrase"
+                      autoComplete="off"
+                      spellCheck={false}
                       className={`${inputClass} resize-none`}
                       rows={3}
                       disabled={loading}
@@ -809,8 +827,8 @@ const ModularAccountApp: React.FC = () => {
                   Network fees are always paid by the Signer Wallet. Do{" "}
                   <strong>not</strong> send {nativeSymbol} to the Smart Wallet
                   for gas. Anything left over stays in the Signer Wallet and can
-                  be withdrawn by importing the same mnemonic in a regular
-                  wallet.
+                  be withdrawn by importing the same private key or mnemonic in
+                  a regular wallet.
                 </>
               }
             >
@@ -1038,8 +1056,8 @@ const ModularAccountApp: React.FC = () => {
 
           <div className="mt-8 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
             <p className="text-xs text-yellow-800">
-              <strong>⚠️ Security Warning:</strong> Never share your mnemonic
-              phrase with anyone. This app runs entirely in your browser and
+              <strong>⚠️ Security Warning:</strong> Never share your private
+              key or mnemonic phrase with anyone. This app runs entirely in your browser and
               sends transactions directly from your signer wallet through the
               selected RPC — no bundler or backend is involved.
             </p>

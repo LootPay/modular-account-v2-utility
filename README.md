@@ -47,13 +47,13 @@ The app runs entirely client-side — no server or backend required.
 Your Modular Account V2 smart wallet involves two addresses:
 
 - **Smart Wallet**: holds your tokens. It has the same address on every network.
-- **Signer Wallet**: the regular wallet derived from your mnemonic. It controls the Smart Wallet and **pays all network fees**.
+- **Signer Wallet**: the regular wallet behind your private key (or mnemonic). It controls the Smart Wallet and **pays all network fees**.
 
 To move tokens out of the Smart Wallet:
 
 1. **Choose the network** where your tokens are. Each network must be recovered separately.
-2. **Import your wallet**: paste your mnemonic phrase and click **Import Wallet**. The app shows the Smart Wallet and Signer Wallet addresses.
-3. **Add gas to the Signer Wallet**: send a small amount of the network's native token (ETH, POL, AVAX, BNB, ...) to the **Signer Wallet** address. The app suggests an amount based on current gas prices. Do **not** send it to the Smart Wallet, as fees are always paid by the Signer Wallet. Any leftover stays in the Signer Wallet and can be withdrawn by importing the same mnemonic in a regular wallet.
+2. **Import your wallet**: paste your private key or your mnemonic phrase and click **Import Wallet**. The app shows the Smart Wallet and Signer Wallet addresses.
+3. **Add gas to the Signer Wallet**: send a small amount of the network's native token (ETH, POL, AVAX, BNB, ...) to the **Signer Wallet** address. The app suggests an amount based on current gas prices. Do **not** send it to the Smart Wallet, as fees are always paid by the Signer Wallet. Any leftover stays in the Signer Wallet and can be withdrawn by importing the same private key or mnemonic in a regular wallet.
 4. **Deploy the Smart Wallet (if needed)**: if the app shows *Not deployed*, click **Deploy Smart Wallet**. This is needed once per network and is paid by the Signer Wallet. Your tokens are safe at the Smart Wallet address before and after deploying.
 5. **Send your tokens**: pick the asset, enter the recipient address and the amount, then click **Send**. Make sure the recipient supports that network. Repeat for each token and network.
 
@@ -62,7 +62,7 @@ To move tokens out of the Smart Wallet:
 ## 🚀 Features
 
 - Pick any supported chain (mainnets and, optionally, testnets) and one of its public RPCs, or a custom RPC
-- Import a signer using a **mnemonic phrase**; the default smart wallet address is computed from the factory (or enter your own)
+- Import a signer using a **private key** or a **mnemonic phrase**; the default smart wallet address is computed from the factory (or enter your own)
 - **Deploy** the smart wallet with `factory.createSemiModularAccount(owner, 0)`, paid by the signer
 - View native and ERC20 balances of the smart wallet and the signer's gas balance
 - Send the **native token**, a **well-known ERC20** for the selected chain (USDC, USDT, DAI, WETH, WBTC, ...) or **any custom ERC20** via `smartWallet.execute(...)`
